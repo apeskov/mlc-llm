@@ -8,6 +8,7 @@ from tvm.relax.op.nn import layer_norm
 from tvm.relax.testing import nn
 from tvm.runtime.ndarray import array as tvm_array
 
+from tvm.script import relax as R
 
 class ModuleList(nn.Module):
     def __init__(self, modules: List[nn.Module]):
@@ -25,6 +26,71 @@ class ModuleList(nn.Module):
     def forward(self, x: relax.Expr) -> relax.Var:
         for module in self.modules:
             x = module(x)
+        return x
+
+
+class QLinear(nn.Module):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        group_size,
+        dtype,
+        bias=True,
+        out_dtype=None,
+    ):
+        num_group = in_features // group_size
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.qweight = nn.Parameter(
+            (in_features // 8, out_features),
+            dtype="int32",
+            name="linear_weight",
+        )
+        self.scales = nn.Parameter(
+            (num_group, out_features),
+            dtype=dtype,
+            name="linear_scl",
+        )
+        self.qzeros = nn.Parameter(
+            (num_group, out_features // 8),
+            dtype="int32",
+            name="linear_zp",
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                (out_features,),
+                dtype=dtype if out_dtype is None else out_dtype,
+                name="linear_bias",
+            )
+        else:
+            self.bias = None
+        self.dtype = dtype
+        self.out_dtype = out_dtype
+
+    def forward(self, x: relax.Expr) -> relax.Var:
+        matmul_impl_name = f"q_matmul_{self.out_features}_{self.in_features}_{self.in_features // self.group_size}"
+        f_matmul_impl = relax.BlockBuilder.current().get().get_global_var(matmul_impl_name)
+        
+        x = nn.emit(x)
+
+        N, K = self.out_features, self.in_features, 
+        _, M, _ = x.struct_info.shape
+        
+        x = nn.emit(reshape(x, shape=[-1, K]))
+        x = nn.emit(
+            R.call_tir(
+                f_matmul_impl, 
+                [x, self.qweight, self.scales, self.qzeros],
+                out_sinfo=R.Tensor((M, N), dtype=x.struct_info.dtype)
+            )
+        )
+        x = nn.emit(reshape(x, shape=[1, -1, N]))
+
+        if self.bias is not None:
+            x = nn.emit(x + self.bias)
         return x
 
 

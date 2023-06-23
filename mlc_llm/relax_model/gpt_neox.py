@@ -25,11 +25,16 @@ from .modules import (
     Embedding,
     LayerNorm,
     Linear,
+    QLinear,
     ModuleList,
     RotaryEmbedding,
     named_parameters,
 )
 
+from .impl_collection import fill_with_impls
+
+USE_QUANTIZED = True
+GROUP_SIZE = 128
 
 class GPTNeoXConfig:  # pylint: disable=too-many-instance-attributes
     def __init__(
@@ -82,10 +87,16 @@ class GPTNeoXAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.rotary_embedding = rotary_embedding
-        self.q_proj = Linear(hidden_size, hidden_size, dtype, bias=True)
-        self.k_proj = Linear(hidden_size, hidden_size, dtype, bias=True)
-        self.v_proj = Linear(hidden_size, hidden_size, dtype, bias=True)
-        self.dense = Linear(hidden_size, hidden_size, dtype, bias=True)
+        if USE_QUANTIZED:
+            self.q_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
+            self.k_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
+            self.v_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
+            self.dense = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
+        else:
+            self.q_proj = Linear(hidden_size, hidden_size, dtype, bias=True)
+            self.k_proj = Linear(hidden_size, hidden_size, dtype, bias=True)
+            self.v_proj = Linear(hidden_size, hidden_size, dtype, bias=True)
+            self.dense = Linear(hidden_size, hidden_size, dtype, bias=True)
         self.dtype = dtype
 
     def forward(
@@ -210,18 +221,34 @@ class GPTNeoXMLP(nn.Module):
         super().__init__()
         if out_dtype is None:
             out_dtype = dtype
-        self.dense_h_to_4h = Linear(
-            hidden_size,
-            intermediate_size,
-            dtype=dtype,
-            out_dtype=out_dtype,
-        )
-        self.dense_4h_to_h = Linear(
-            intermediate_size,
-            hidden_size,
-            dtype=dtype,
-            out_dtype=out_dtype,
-        )
+        if USE_QUANTIZED:
+            self.dense_h_to_4h = QLinear(
+                hidden_size,
+                intermediate_size,
+                GROUP_SIZE,
+                dtype=dtype,
+                out_dtype=out_dtype,
+            )
+            self.dense_4h_to_h = QLinear(
+                intermediate_size,
+                hidden_size,
+                GROUP_SIZE,
+                dtype=dtype,
+                out_dtype=out_dtype,
+            )
+        else:
+            self.dense_h_to_4h = Linear(
+                hidden_size,
+                intermediate_size,
+                dtype=dtype,
+                out_dtype=out_dtype,
+            )
+            self.dense_4h_to_h = Linear(
+                intermediate_size,
+                hidden_size,
+                dtype=dtype,
+                out_dtype=out_dtype,
+            )
         self.dtype = dtype
 
     def forward(self, hidden_states):
@@ -617,6 +644,13 @@ def get_model(
     )
 
     bb = relax.BlockBuilder()
+    fill_with_impls(bb, config = {
+        # (config.hidden_size * 3,  config.hidden_size,  config.hidden_size // GROUP_SIZE),  # concatinated linear
+        (config.hidden_size,  config.hidden_size,  config.hidden_size // GROUP_SIZE),
+        (config.hidden_size * 4,  config.hidden_size,  config.hidden_size // GROUP_SIZE),
+        (config.hidden_size,  config.hidden_size * 4,  config.hidden_size // GROUP_SIZE * 4),
+    })
+
     pidx2pname = create_encoding_func(bb, config)
     create_decoding_func(bb, config)
     create_kv_cache_func(bb, config)
@@ -653,6 +687,10 @@ def get_model(
         args.model_path, set(pidx2pname.values()), f_convert_pname_fwd
     )
 
+    # Use other bin file with quantized weights. Produced by GPTQ 
+    if USE_QUANTIZED:
+         pname2binname = {k:"dolly2-4bit-12b.pt" for k,v in pname2binname.items()}
+
     num_heads = config.num_attention_heads
     hidden_size = config.hidden_size
     head_dim = hidden_size // num_heads
@@ -667,6 +705,46 @@ def get_model(
             q_weight = raw_param[:, 0, :, :].reshape(hidden_size, hidden_size)
             k_weight = raw_param[:, 1, :, :].reshape(hidden_size, hidden_size)
             v_weight = raw_param[:, 2, :, :].reshape(hidden_size, hidden_size)
+
+            return [
+                (torch_pname.replace("query_key_value", "q_proj"), q_weight),
+                (torch_pname.replace("query_key_value", "k_proj"), k_weight),
+                (torch_pname.replace("query_key_value", "v_proj"), v_weight),
+            ]
+        elif torch_pname.endswith("query_key_value.qweight"):
+            assert raw_param.ndim == 2
+            raw_param = raw_param.reshape(
+                hidden_size//8, num_heads, 3, head_dim,
+            )
+            q_weight = raw_param[:, :, 0, :].reshape(hidden_size//8, hidden_size)
+            k_weight = raw_param[:, :, 1, :].reshape(hidden_size//8, hidden_size)
+            v_weight = raw_param[:, :, 2, :].reshape(hidden_size//8, hidden_size)
+            return [
+                (torch_pname.replace("query_key_value", "q_proj"), q_weight),
+                (torch_pname.replace("query_key_value", "k_proj"), k_weight),
+                (torch_pname.replace("query_key_value", "v_proj"), v_weight),
+            ]
+        elif torch_pname.endswith("query_key_value.scales"):
+            assert raw_param.ndim == 2
+            raw_param = raw_param.astype(dtype).reshape(
+                -1, num_heads, 3, head_dim,
+            )
+            q_weight = raw_param[:, :, 0, :].reshape(-1, hidden_size)
+            k_weight = raw_param[:, :, 1, :].reshape(-1, hidden_size)
+            v_weight = raw_param[:, :, 2, :].reshape(-1, hidden_size)
+            return [
+                (torch_pname.replace("query_key_value", "q_proj"), q_weight),
+                (torch_pname.replace("query_key_value", "k_proj"), k_weight),
+                (torch_pname.replace("query_key_value", "v_proj"), v_weight),
+            ]
+        elif torch_pname.endswith("query_key_value.qzeros"):
+            assert raw_param.ndim == 2
+            raw_param = raw_param.reshape(
+                -1, num_heads, 3, head_dim//8,
+            )
+            q_weight = raw_param[:, :, 0, :].reshape(-1, hidden_size//8)
+            k_weight = raw_param[:, :, 1, :].reshape(-1, hidden_size//8)
+            v_weight = raw_param[:, :, 2, :].reshape(-1, hidden_size//8)
             return [
                 (torch_pname.replace("query_key_value", "q_proj"), q_weight),
                 (torch_pname.replace("query_key_value", "k_proj"), k_weight),
@@ -694,7 +772,10 @@ def get_model(
         ):
             return [(torch_pname, raw_param.astype(ffn_out_dtype))]
         else:
-            return [(torch_pname, raw_param.astype(dtype))]
+            if raw_param.dtype == "int32":  # int4 weight declare dtype int32. Keep it as is
+                return [(torch_pname, raw_param)]
+            else:    
+                return [(torch_pname, raw_param.astype(dtype))]
 
     args.pidx2pname = pidx2pname
     args.pname2binname = pname2binname
