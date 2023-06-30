@@ -13,6 +13,7 @@ import mlc_llm
 from mlc_llm import utils
 from mlc_llm.relax_model import gpt_neox, llama, moss, rwkv
 
+import tvm.tir.tensor_intrin.cuda
 
 def _parse_args():
     args = argparse.ArgumentParser()
@@ -78,7 +79,7 @@ def _parse_args():
     if os.path.exists(parsed.db_path):
         filenames = os.listdir(parsed.db_path)
         if (
-            len(filenames) == 2
+            len(filenames) >= 2
             and "database_workload.json" in filenames
             and "database_tuning_record.json" in filenames
         ):
