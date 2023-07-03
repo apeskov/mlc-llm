@@ -70,15 +70,16 @@ class QLinear(nn.Module):
         self.dtype = dtype
         self.out_dtype = out_dtype
 
-    def forward(self, x: relax.Expr) -> relax.Var:
-        matmul_impl_name = f"q_matmul_{self.out_features}_{self.in_features}_{self.in_features // self.group_size}"
-        f_matmul_impl = relax.BlockBuilder.current().get().get_global_var(matmul_impl_name)
-        
+    def forward(self, x: relax.Expr) -> relax.Var:        
         x = nn.emit(x)
 
         N, K = self.out_features, self.in_features, 
         _, M, _ = x.struct_info.shape
         
+        M_spec = "1" if M == 1 else "m"
+        matmul_impl_name = f"q_matmul_{M_spec}_{self.out_features}_{self.in_features}_{self.in_features // self.group_size}"
+        f_matmul_impl = relax.BlockBuilder.current().get().get_global_var(matmul_impl_name)
+
         x = nn.emit(reshape(x, shape=[-1, K]))
         x = nn.emit(
             R.call_tir(
