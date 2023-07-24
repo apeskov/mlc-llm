@@ -99,7 +99,15 @@ def answer_prompt(args) -> None:
     # prompt = "2 plus 2"
     # prompt = "Write the introduction to a steamy romance novel"
     # prompt = "Lovely poema with flowers"
-    prompt = "What is the capital of Russia?"
+    # prompt = "What is the capital of Russia?"
+    prompt = "Could you please write the introduction to a steamy romance novel as long as possible. " \
+             "It should be love story about boy and girl at wild west at 2042. " \
+             "Could you please write the introduction to a steamy romance novel as long as possible. " \
+             "It should be love story about boy and girl at wild west at 2042. " \
+             "Could you please write the introduction to a steamy romance novel as long as possible. " \
+             "It should be love story about boy and girl at wild west at 2042. " \
+             "Thanks a lot in advance"
+
 
     full_prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n\n\n" \
                   f"### Instruction:\n{prompt}\n\n" \
@@ -135,18 +143,19 @@ def answer_prompt(args) -> None:
     cur_seq_len = inputs.shape[1]
     answer_tokens = []
     
-    print("Running inference...")
+    print(f"Running inference... seq_len: {cur_seq_len}")
     
     # from torch.profiler import profile, ProfilerActivity
     # with profile(activities=[ProfilerActivity.CUDA], with_modules=False, with_stack=True) as prof:
-
+        
+    start = time.time()
     logits, kv_caches = vm["prefill"](inputs, seq_len_shape, kv_caches, const_params)
     prob = vm["softmax_with_temperature"](logits, temperature_arr)
     next_token = sample_top_p_from_prob(prob, top_p, random.uniform(0, 1))
     
     answer_tokens.append(next_token)
     
-    for _ in range(100):
+    for _ in range(128):
         next_token_nd.copyfrom(np.array([[next_token]], dtype="float32"))
         cur_seq_len += 1
         cur_seq_len_shape = tvm.runtime.ShapeTuple([cur_seq_len])
@@ -163,7 +172,9 @@ def answer_prompt(args) -> None:
             break
         else: 
             answer_tokens.append(next_token)
-    
+    end = time.time()
+    print(f"Time elapsed: {(end - start)} sec")
+
     # prof.export_chrome_trace("./trace_llm_tvm.json")
 
     answer_text = tokenizer.decode(answer_tokens) 
