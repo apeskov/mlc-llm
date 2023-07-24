@@ -13,6 +13,7 @@ from tvm.relax.op import (
     minimum,
     permute_dims,
     reshape,
+    split,
     squeeze,
 )
 from tvm.relax.op.nn import gelu, softmax
@@ -34,6 +35,7 @@ from .modules import (
 from .impl_collection import fill_with_impls
 
 USE_QUANTIZED = True
+USE_FUSED_QKV = True
 GROUP_SIZE = 128
 
 class GPTNeoXConfig:  # pylint: disable=too-many-instance-attributes
@@ -87,10 +89,14 @@ class GPTNeoXAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.rotary_embedding = rotary_embedding
+
         if USE_QUANTIZED:
-            self.q_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
-            self.k_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
-            self.v_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
+            if USE_FUSED_QKV:
+                self.query_key_value = QLinear(hidden_size, 3*hidden_size, GROUP_SIZE, dtype, bias=True)
+            else:
+                self.q_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
+                self.k_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
+                self.v_proj = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
             self.dense = QLinear(hidden_size, hidden_size, GROUP_SIZE, dtype, bias=True)
         else:
             self.q_proj = Linear(hidden_size, hidden_size, dtype, bias=True)
@@ -120,12 +126,20 @@ class GPTNeoXAttention(nn.Module):
                 )
             )
 
-        # q/k/v states: [batch_size, seq_len, num_attention_heads, head_size]
-        q, k, v = (
-            _project(self.q_proj),
-            _project(self.k_proj),
-            _project(self.v_proj),
-        )
+        if USE_FUSED_QKV:
+            qkv = nn.emit(self.query_key_value(hidden_states))
+            qkv = nn.emit(reshape(qkv, shape=((batch_size, seq_len, 3 * self.num_heads, self.head_dim))))
+            qkv = nn.emit(split(qkv, 3, axis=2))
+            q = nn.emit(qkv[0])
+            k = nn.emit(qkv[1])
+            v = nn.emit(qkv[2])
+        else:
+            # q/k/v states: [batch_size, seq_len, num_attention_heads, head_size]
+            q, k, v = (
+                _project(self.q_proj),
+                _project(self.k_proj),
+                _project(self.v_proj),
+            )
         q, k = self.rotary_embedding(q, k, kv_seq_len - seq_len)
 
         if past_key_value is not None:
@@ -454,7 +468,7 @@ class GPTNeoXForCausalLM(nn.Module):
             in_features=config.hidden_size,
             out_features=config.vocab_size,
             bias=False,
-            dtype="float32",
+            dtype="float16",
         )
 
     def forward(
@@ -482,8 +496,9 @@ class GPTNeoXForCausalLM(nn.Module):
             hidden_states,
             primfunc_name_hint="slice",
         )
-        hidden_states = astype(hidden_states, "float32")
+        # hidden_states = astype(hidden_states, "float32")
         logits = self.embed_out(hidden_states)
+        logits = astype(logits, "float32")
         return logits, key_value_cache
 
 
@@ -676,9 +691,8 @@ def get_model(
 
     def f_convert_pname_fwd(pname: str) -> str:
         import re  # pylint: disable=import-outside-toplevel
-
         str_pattern = re.compile(r"(q|k|v)_proj")
-        if re.search(str_pattern, pname) is not None:
+        if re.search(str_pattern, pname) is not None and not USE_FUSED_QKV:
             return str_pattern.sub("query_key_value", pname)
         else:
             return pname
@@ -713,60 +727,76 @@ def get_model(
             ]
         elif torch_pname.endswith("query_key_value.qweight"):
             assert raw_param.ndim == 2
-            raw_param = raw_param.reshape(
-                hidden_size//8, num_heads, 3, head_dim,
-            )
-            q_weight = raw_param[:, :, 0, :].reshape(hidden_size//8, hidden_size)
-            k_weight = raw_param[:, :, 1, :].reshape(hidden_size//8, hidden_size)
-            v_weight = raw_param[:, :, 2, :].reshape(hidden_size//8, hidden_size)
-            return [
-                (torch_pname.replace("query_key_value", "q_proj"), q_weight),
-                (torch_pname.replace("query_key_value", "k_proj"), k_weight),
-                (torch_pname.replace("query_key_value", "v_proj"), v_weight),
-            ]
+            if USE_FUSED_QKV:
+                raw_param = raw_param.reshape(
+                    hidden_size//8, num_heads, 3, head_dim,
+                )
+                return [(torch_pname, raw_param.transpose(0, 2, 1, 3).reshape(-1, 3*hidden_size))]
+            else:
+                raw_param = raw_param.reshape(
+                    hidden_size//8, num_heads, 3, head_dim,
+                )
+                q_weight = raw_param[:, :, 0, :].reshape(hidden_size//8, hidden_size)
+                k_weight = raw_param[:, :, 1, :].reshape(hidden_size//8, hidden_size)
+                v_weight = raw_param[:, :, 2, :].reshape(hidden_size//8, hidden_size)
+                return [
+                    (torch_pname.replace("query_key_value", "q_proj"), q_weight),
+                    (torch_pname.replace("query_key_value", "k_proj"), k_weight),
+                    (torch_pname.replace("query_key_value", "v_proj"), v_weight),
+                ]
         elif torch_pname.endswith("query_key_value.scales"):
             assert raw_param.ndim == 2
-            raw_param = raw_param.astype(dtype).reshape(
-                -1, num_heads, 3, head_dim,
-            )
-            q_weight = raw_param[:, :, 0, :].reshape(-1, hidden_size)
-            k_weight = raw_param[:, :, 1, :].reshape(-1, hidden_size)
-            v_weight = raw_param[:, :, 2, :].reshape(-1, hidden_size)
-            return [
-                (torch_pname.replace("query_key_value", "q_proj"), q_weight),
-                (torch_pname.replace("query_key_value", "k_proj"), k_weight),
-                (torch_pname.replace("query_key_value", "v_proj"), v_weight),
-            ]
+            if USE_FUSED_QKV:
+                raw_param = raw_param.astype(dtype).reshape(
+                    -1, num_heads, 3, head_dim,
+                )
+                return [(torch_pname, raw_param.transpose(0, 2, 1, 3).reshape(-1, 3*hidden_size))]
+            else:                
+                raw_param = raw_param.astype(dtype).reshape(
+                    -1, num_heads, 3, head_dim,
+                )
+                q_weight = raw_param[:, :, 0, :].reshape(-1, hidden_size)
+                k_weight = raw_param[:, :, 1, :].reshape(-1, hidden_size)
+                v_weight = raw_param[:, :, 2, :].reshape(-1, hidden_size)
+                return [
+                    (torch_pname.replace("query_key_value", "q_proj"), q_weight),
+                    (torch_pname.replace("query_key_value", "k_proj"), k_weight),
+                    (torch_pname.replace("query_key_value", "v_proj"), v_weight),
+                ]
         elif torch_pname.endswith("query_key_value.qzeros"):
             assert raw_param.ndim == 2
-            raw_param = raw_param.reshape(
-                -1, num_heads, 3, head_dim//8,
-            )
-            q_weight = raw_param[:, :, 0, :].reshape(-1, hidden_size//8)
-            k_weight = raw_param[:, :, 1, :].reshape(-1, hidden_size//8)
-            v_weight = raw_param[:, :, 2, :].reshape(-1, hidden_size//8)
-            return [
-                (torch_pname.replace("query_key_value", "q_proj"), q_weight),
-                (torch_pname.replace("query_key_value", "k_proj"), k_weight),
-                (torch_pname.replace("query_key_value", "v_proj"), v_weight),
-            ]
+            if USE_FUSED_QKV:
+                raw_param = raw_param.reshape(
+                    -1, num_heads, 3, head_dim//8,
+                )
+                return [(torch_pname, raw_param.transpose(0, 2, 1, 3).reshape(-1, 3*hidden_size//8))]
+            else:
+                raw_param = raw_param.reshape(
+                    -1, num_heads, 3, head_dim//8,
+                )
+                q_weight = raw_param[:, :, 0, :].reshape(-1, hidden_size//8)
+                k_weight = raw_param[:, :, 1, :].reshape(-1, hidden_size//8)
+                v_weight = raw_param[:, :, 2, :].reshape(-1, hidden_size//8)
+                return [
+                    (torch_pname.replace("query_key_value", "q_proj"), q_weight),
+                    (torch_pname.replace("query_key_value", "k_proj"), k_weight),
+                    (torch_pname.replace("query_key_value", "v_proj"), v_weight),
+                ]
         elif torch_pname.endswith("query_key_value.bias"):
             assert raw_param.ndim == 1
-            raw_param = raw_param.astype(dtype).reshape(num_heads, 3, head_dim)
-            q_bias = raw_param[:, 0, :].reshape(hidden_size)
-            k_bias = raw_param[:, 1, :].reshape(hidden_size)
-            v_bias = raw_param[:, 2, :].reshape(hidden_size)
-            return [
-                (torch_pname.replace("query_key_value", "q_proj"), q_bias),
-                (torch_pname.replace("query_key_value", "k_proj"), k_bias),
-                (torch_pname.replace("query_key_value", "v_proj"), v_bias),
-            ]
-        elif (
-            "layernorm" in torch_pname
-            or "layer_norm" in torch_pname
-            or "embed_out" in torch_pname
-        ):
-            return [(torch_pname, raw_param.astype("float32"))]
+            if USE_FUSED_QKV:
+                raw_param = raw_param.astype(dtype).reshape(num_heads, 3, head_dim)
+                return [(torch_pname, raw_param.transpose(1, 0, 2).reshape(3*hidden_size))]
+            else:
+                raw_param = raw_param.astype(dtype).reshape(num_heads, 3, head_dim)
+                q_bias = raw_param[:, 0, :].reshape(hidden_size)
+                k_bias = raw_param[:, 1, :].reshape(hidden_size)
+                v_bias = raw_param[:, 2, :].reshape(hidden_size)
+                return [
+                    (torch_pname.replace("query_key_value", "q_proj"), q_bias),
+                    (torch_pname.replace("query_key_value", "k_proj"), k_bias),
+                    (torch_pname.replace("query_key_value", "v_proj"), v_bias),
+                ]
         elif (
             ".dense_h_to_4h.bias" in torch_pname or ".dense_4h_to_h.bias" in torch_pname
         ):

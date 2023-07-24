@@ -9,6 +9,9 @@ from tvm.relax.testing import nn
 from tvm.runtime.ndarray import array as tvm_array
 
 from tvm.script import relax as R
+from tvm import tir as T
+
+USE_R_FACTOR = 4
 
 class ModuleList(nn.Module):
     def __init__(self, modules: List[nn.Module]):
@@ -70,28 +73,139 @@ class QLinear(nn.Module):
         self.dtype = dtype
         self.out_dtype = out_dtype
 
-    def forward(self, x: relax.Expr) -> relax.Var:        
+    def forward(self, x: relax.Expr) -> relax.Var:
+        """
+        QLinear implementation
+
+        Has several work arounds:
+        WA1: Use 2D matmul block. Because Realx branch I'm using for tuning doesn't support 3D tensor 
+             as input for matmul block. "tensor-core" meta schedule rules fails with that.
+        WA2: Use explicit reduction factor. R-factor is important part of performance, but TVM-main 
+             doesn't produce schedule with r-factor instriction during tuning.
+        WA3: Use explicit cast iterators to int32. Bu default Relax uses int64 and it breaks cuda 
+             performance because of redundant cast ops.
+        WA4: Relax tuner is not able to process batched_matmul, so we skip rfactor for dynamic version 
+        """
         x = nn.emit(x)
-
-        N, K = self.out_features, self.in_features, 
-        _, M, _ = x.struct_info.shape
         
-        M_spec = "1" if M == 1 else "m"
-        matmul_impl_name = f"q_matmul_{M_spec}_{self.out_features}_{self.in_features}_{self.in_features // self.group_size}"
-        f_matmul_impl = relax.BlockBuilder.current().get().get_global_var(matmul_impl_name)
+        # WA4
+        is_m_static = isinstance(x.struct_info.shape[1], T.IntImm)
+        RF = 4 if is_m_static else 1
 
-        x = nn.emit(reshape(x, shape=[-1, K]))
-        x = nn.emit(
-            R.call_tir(
-                f_matmul_impl, 
-                [x, self.qweight, self.scales, self.qzeros],
-                out_sinfo=R.Tensor((M, N), dtype=x.struct_info.dtype)
+        def q_linear_te(x, qwgh, qzp, scl, bias):            
+            # Decode weights
+            decoded_zp = te.compute(
+                (qzp.shape[0], qzp.shape[1]*8),
+                lambda vg, vn: 
+                    (qzp[vg, vn // 8] >> (vn.astype("int32") % 8 * 4) & 0xF) + 1,
+                    name="decode_zp"
+                )
+            decoded_wgh = te.compute(
+                (qwgh.shape[0] * 8, qwgh.shape[1]),
+                lambda vk, vn: 
+                    ((qwgh[vk // 8, vn] >> (vk.astype("int32") % 8 * 4) & 0xF) - decoded_zp[vk // self.group_size, vn]).astype(self.dtype) * 
+                    scl[vk // self.group_size, vn],
+                name="decode_wgh"
+                )
+            
+            # Reshape in. WA1
+            x = te.compute(
+                (x.shape[1], x.shape[2]),
+                lambda vm, vk: x[0, vm, vk],
+                name="reshape_in"
             )
-        )
-        x = nn.emit(reshape(x, shape=[1, -1, N]))
 
-        if self.bias is not None:
-            x = nn.emit(x + self.bias)
+            k = te.reduce_axis((0, decoded_wgh.shape[0]), name="k")                
+            x = te.compute(
+                (x.shape[0], qwgh.shape[1]),
+                lambda vm, vn: te.sum(x[vm, k] * decoded_wgh[k, vn], axis=k),
+                name="matmul"
+            )
+
+            # Reshape out, WA1
+            x = te.compute(
+                (1, x.shape[0], x.shape[1]),
+                lambda _, vm, vn: x[vm, vn],
+                name="reshape_out"
+            )
+
+            if bias is not None:
+                x = x + bias
+            
+            return x
+
+        def q_linear_te_rf(x, qwgh, qzp, scl, bias):
+            M, N, K = x.shape[1], self.out_features, self.in_features
+
+            # Decode weights
+            decoded_zp = te.compute(
+                (qzp.shape[0], qzp.shape[1]*8),
+                lambda vg, vn: 
+                    (qzp[vg, vn // 8] >> (vn.astype("int32") % 8 * 4) & 0xF) + 1,
+                name="decode_zp",
+            )
+            wgh = te.compute(
+                (qwgh.shape[0] * 8, qwgh.shape[1]),
+                lambda vk, vn: 
+                    ((qwgh[vk // 8, vn] >> (vk.astype("int32") % 8 * 4) & 0xF) - decoded_zp[vk // self.group_size, vn]).astype(self.dtype) * 
+                    scl[vk // self.group_size, vn],
+                name="decode_wgh",
+            )
+
+            # Reshape A in (M, RF, K//RF). WA2
+            x = te.compute(
+                (M, RF, K//RF),
+                lambda vm, kb, vk: x[0, vm, vk + kb * K//RF],
+                name="reshape_in"
+            )
+
+            # Reshape B to (RF, K//RF, N). WA2
+            wgh= te.compute(
+                (RF , K//RF, N),
+                lambda kb, vk, vn: wgh[vk + kb * K//RF, vn],
+                name="resh_b"
+            )
+
+            # Batched matmul.
+            k = te.reduce_axis((0, K//RF), name="k")
+            x = te.compute(
+                (RF, M, N),
+                lambda kb, vm, vn: te.sum(x[vm, kb, k] * wgh[kb, k, vn], axis=k),
+                name="matmul"
+            )
+
+            # Final reduction v0. Is bad, prevent from fusing. 
+            # rf = te.reduce_axis((0, RF), name="k")
+            # x = te.compute(
+            #     (1, M, N),
+            #     lambda _, vm, vn: te.sum(x[rf, vm, vn], axis=rf),
+            #     name=f"reduction_{RF}"
+            # )
+            
+            # Final reduction v1
+            if RF == 2:
+                x = te.compute(
+                    (1, M, N),
+                    lambda _, vm, vn: x[0, vm, vn] + x[1, vm, vn],
+                    name="reduction_2"
+                )
+            elif RF == 4:
+                x = te.compute(
+                    (1, M, N),
+                    lambda _, vm, vn: x[0, vm, vn] + x[1, vm, vn] + x[2, vm, vn] + x[3, vm, vn],
+                    name="reduction_4"
+                )
+            else:
+                assert False, "Unimplemented"
+
+            if bias is not None:
+                x = x + bias
+            
+            return x
+
+        impl = q_linear_te if RF == 1 else q_linear_te_rf
+        x = nn.emit_te(impl, x, self.qweight, self.qzeros, self.scales, self.bias, 
+                       primfunc_name_hint="q_matmul")
         return x
 
 
@@ -123,9 +237,38 @@ class Linear(nn.Module):
         self.out_dtype = out_dtype
 
     def forward(self, x: relax.Expr) -> relax.Var:
-        x = nn.emit(x)
-        weight = permute_dims(self.weight, axes=None)
-        x = nn.emit(matmul(x, weight, out_dtype=self.out_dtype))
+        if True:
+            def q_linear_te_impl(x, wgh):                
+                # Reshape in. WA
+                x = te.compute(
+                    (x.shape[1], x.shape[2]),
+                    lambda vm, vk: x[0, vm, vk],
+                    name="reshape_in"
+                )
+
+                k = te.reduce_axis((0, wgh.shape[1]), name="k")                
+                x = te.compute(
+                    (x.shape[0], wgh.shape[0]),
+                    lambda vm, vn: te.sum(x[vm, k] * wgh[vn, k], axis=k),
+                    name="matmul"
+                )
+
+                # Reshape out. WA
+                x = te.compute(
+                    (1, x.shape[0], x.shape[1]),
+                    lambda _, vm, vn: x[vm, vn],
+                    name="reshape_out"
+                )
+                
+                return x
+            
+            x = nn.emit(x)
+            x = nn.emit_te(q_linear_te_impl, x, self.weight, primfunc_name_hint="matmul")
+        else:
+            x = nn.emit(x)
+            weight = permute_dims(self.weight, axes=None)
+            x = nn.emit(matmul(x, weight, out_dtype=self.out_dtype))
+
         if self.bias is not None:
             x = nn.emit(x + self.bias)
         return x
@@ -159,12 +302,13 @@ class LayerNorm(nn.Module):
     ):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter((hidden_size,), dtype="float32", name="weight")
-        self.bias = nn.Parameter((hidden_size,), dtype="float32", name="bias")
+        self.weight = nn.Parameter((hidden_size,), dtype=dtype, name="weight")
+        self.bias = nn.Parameter((hidden_size,), dtype=dtype, name="bias")
+        self.dtype = dtype
 
     def forward(self, x: relax.Expr) -> relax.Var:
-        if x.struct_info.dtype != "float32":
-            x = nn.emit(relax.op.astype(x, "float32"))
+        if x.struct_info.dtype != self.dtype:
+            x = nn.emit(relax.op.astype(x, self.dtype))
         x = nn.emit(
             layer_norm(
                 x,
