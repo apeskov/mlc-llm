@@ -132,7 +132,8 @@ def load_torch_pname2binname_map(
             pname2binname = torch_bin_json["weight_map"]
     else:
         # Single weight shard.
-        single_shard_path = os.path.join(model_path, "pytorch_model.bin")
+        # single_shard_path = os.path.join(model_path, "pytorch_model.bin")
+        single_shard_path = os.path.join(model_path, "dolly2-4bit-12b.pt")
         assert os.path.isfile(single_shard_path)
         pname2binname = {
             f_convert_pname_fwd(pname): "pytorch_model.bin" for pname in pnames
