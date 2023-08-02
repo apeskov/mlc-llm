@@ -806,10 +806,12 @@ def load_torch_pname2binname_map(
             torch_pname2binname = torch_bin_json["weight_map"]
     else:
         # Single weight shard.
-        single_shard_path = os.path.join(model_path, "pytorch_model.bin")
+        # bin_file_name = "pytorch_model.bin"
+        bin_file_name = "gptq_model-4bit-128g.bin"
+        single_shard_path = os.path.join(model_path, bin_file_name)
         assert os.path.isfile(single_shard_path)
         torch_pname2binname = {
-            torch_pname: "pytorch_model.bin"
+            torch_pname: bin_file_name
             for relax_pname in relax_pnames
             for torch_pname in f_convert_pname_fwd(relax_pname)
         }

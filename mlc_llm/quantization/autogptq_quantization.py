@@ -5,10 +5,17 @@ import numpy as np
 from tvm._ffi.runtime_ctypes import Device
 from tvm import relax, te, tir, topi
 from tvm.script import tir as T
+import torch
 
 from . import tir_utils
 from .quantization import QuantizationSpec
 from .quantization import FDequantize
+
+
+def fake_load_autogptq(model_path: str):
+    param_dict = torch.load(model_path + "/gptq_model-4bit-128g.bin")
+    param_dict = {f"model.{name}": arr for name, arr in param_dict.items()}
+    return param_dict
 
 
 def load_autogptq_params(
@@ -18,17 +25,7 @@ def load_autogptq_params(
     device: Device,
     excluded_params: List[str] = ["cos_cached", "sin_cached"],
 ) -> List[relax.Var]:
-    try:
-        import auto_gptq  # pylint: disable=import-outside-toplevel
-    except ImportError:
-        raise ImportError(
-            "Please install auto_gptq package to use AutoGPTQ quantization."
-        )
-
-    from auto_gptq import AutoGPTQForCausalLM
-
-    model = AutoGPTQForCausalLM.from_quantized(model_path).cpu()
-    param_dict = model.state_dict()
+    param_dict = fake_load_autogptq(model_path)
     for pidx, pname in pidx2pname.items():
         if any(excluded_param in pname for excluded_param in excluded_params):
             continue
