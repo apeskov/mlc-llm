@@ -23,6 +23,8 @@ from mlc_llm.relax_model import (
     rwkv,
 )
 
+from mlc_llm.transform import fuse_split_rotary_embedding, rewrite_attention
+from tvm.relax.backend.contrib.cutlass import partition_for_cutlass
 
 @dataclass
 class BuildArgs:
@@ -273,6 +275,7 @@ def mod_transform_before_build(
     mod: tvm.IRModule,
     param_manager: param_manager.ParamManager,
     args: argparse.Namespace,
+    config,
 ) -> tvm.IRModule:
     """First-stage: Legalize ops and trace"""
     if args.model.startswith("rwkv-"):
@@ -295,6 +298,17 @@ def mod_transform_before_build(
         ]
         if args.sep_embed:
             model_names = ["embed", "prefill_with_embed"] + model_names[1:]
+
+    # from Massa
+    mod = fuse_split_rotary_embedding(mod, config["num_hidden_layers"])
+    mod["prefill"] = rewrite_attention(mod["prefill"])
+    mod["decode"] = rewrite_attention(mod["decode"])
+
+    mod = partition_for_cutlass(mod)
+    mod = relax.transform.RunCodegen(
+        {"cutlass": {"sm": 80, "find_first_valid": False}},
+        entry_functions=model_names # + ["transform_params"]
+    )(mod)
 
     mod = param_manager.transform_dequantize(mod)
     mod = mlc_llm.transform.FuseDecodeTranspose()(mod)  # pylint: disable=not-callable
@@ -430,7 +444,7 @@ def build_model_from_args(args: argparse.Namespace):
         if args.convert_weight_only:
             exit(0)
 
-        mod = mod_transform_before_build(mod, param_manager, args)
+        mod = mod_transform_before_build(mod, param_manager, args, config)
         with open(cache_path, "wb") as outfile:
             pickle.dump(mod, outfile)
         print(f"Save a cached module to {cache_path}.")
