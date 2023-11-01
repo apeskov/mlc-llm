@@ -173,6 +173,22 @@ class BuildArgs:
             "action": "store_true",
         },
     )
+    tune_only: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to only tune matmul kernels and produse tuning database. "
+                    "Do not build model and do not convert model weights.",
+            "action": "store_true",
+        },
+    )
+    tune_db_path: str = field(
+        default="auto",
+        metadata={
+            "help": 'Path to tuning data base to use during compilation. Value "auto" means '
+                    'to use default path: {artifact_path}/{model_name}/dtune. Value "no" means '
+                    'do not use data base at all.'
+        },
+    )
     debug_dump: bool = field(
         default=False,
         metadata={
@@ -248,6 +264,13 @@ class BuildArgs:
         default=False,
         metadata={
             "help": ("Disable offloading layer and RMS norm operations to CUTLASS."),
+            "action": "store_true",
+        },
+    )
+    no_cutlass_decode_matmul: bool = field(
+        default=False,
+        metadata={
+            "help": ("Disable offloading decode+matmul operations to CUTLASS."),
             "action": "store_true",
         },
     )
@@ -539,7 +562,7 @@ def mod_transform_before_build(
             patterns += get_patterns_with_prefix("cutlass.layer_norm")
             patterns += get_patterns_with_prefix("cutlass.rms_norm")
 
-        if has_cutlass and use_ft_quant:
+        if has_cutlass and use_ft_quant and not args.no_cutlass_decode_matmul:
             patterns += get_patterns_with_prefix("cutlass.decode_matmul")
 
         has_cublas = tvm.get_global_func("relax.ext.cublas", True)
@@ -638,6 +661,47 @@ def dump_mlc_chat_config(
     print(f"Finish exporting chat config to {args.chat_config_path}")
 
 
+def tune(mod_deploy: tvm.IRModule, args: argparse.Namespace):
+    print("Start tuning")
+    m_pad = 64
+    from tvm import meta_schedule as ms
+    
+    tuning_tasks = ms.relax_integration.extract_tasks(mod_deploy, args.target)    
+    funcs = {tt.task_name:tt.mod["main"] for tt in tuning_tasks}
+    
+    # Simple filtering. Keep quantized linear operators only
+    def func_filter(func, name):
+        if not ("matmul" in name and "decode" in name):
+            return False
+        if "vocab_size" in str(func):
+            return False
+        return True
+    funcs = {name:f for name, f in funcs.items() if func_filter(f, name)}
+
+    def put_dyn_var_hint(func):
+        return func.with_attr({"metaschedule.hint.dyn_var_value": {"n": m_pad}})
+    funcs = {name:put_dyn_var_hint(f) for name, f in funcs.items() }
+
+    mod_to_tune = tvm.IRModule(funcs)
+
+    if args.tune_db_path == "no":
+        assert False, "Conflict of arguments. During 'tune_only' mode the argument 'tune_db_path' cannot be 'no'"
+
+    if args.tune_db_path == "auto":
+        work_dir = os.path.join(args.artifact_path, "dtune") if args.tune_db_path == "auto" else args.tune_db_path
+    
+    ms.tir_integration.tune_tir(
+        mod=mod_to_tune,
+        target=args.target,
+        work_dir=work_dir,
+        max_trials_global=100500,
+        max_trials_per_task=4096,
+        num_trials_per_iter=32,
+        cost_model="random", 
+        space=utils.dtune_space_gen()
+    )
+
+
 def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
     target_kind = args.target_kind
     if args.system_lib_prefix:
@@ -648,13 +712,16 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
         mod_deploy, f"{args.model}_{args.quantization.name}".replace("-", "_"), args
     )
 
+    db = utils.dtune_load_db(args)
+
     if target_kind != "cpu":
         dispatch_target = (
             args.target
             if args.target_kind != "webgpu"
             else tvm.target.Target("apple/m1-gpu-restricted")
         )
-        with dispatch_target:
+        with dispatch_target, db:
+            mod_deploy = relax.transform.MetaScheduleApplyDatabase()(mod_deploy)
             mod_deploy = dl.ApplyDefaultSchedule(  # pylint: disable=not-callable
                 dl.gpu.Matmul(),
                 dl.gpu.GEMV(),
@@ -755,7 +822,7 @@ def build_model_from_args(args: argparse.Namespace):
             qspec_updater = qspec_updater_class(param_manager)
             qspec_updater.visit_module(mod)
 
-        if not args.build_model_only:
+        if not args.build_model_only and not args.tune_only:
             parameter_transforms = []
 
             # Run pre-quantization if provided.
@@ -820,6 +887,11 @@ def build_model_from_args(args: argparse.Namespace):
             exit(0)
 
         mod = mod_transform_before_build(mod, param_manager, args, model_config)
+        
+        if args.tune_only:
+            tune(mod, args)
+            exit(0)
+
         if args.num_shards > 1:
             # We require a "create_sharding_info" function for all
             # multi-GPU models, even if they are using pre-sharded
