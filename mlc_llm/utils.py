@@ -678,7 +678,7 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
     def _initialize_with_tune_context(self, context) -> None:
         pass
     
-    def is_acceptable(self, sch, block):
+    def is_acceptable(self, sch: tvm.tir.Schedule, block):
         """Check if provided block is gemm
         Trifial implementation. Check blpck name ends with "_matmul"
         Is not correct for general cases. 
@@ -686,16 +686,29 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
         b = sch.get(block)
         return "matmul" in b.name_hint
 
+    def deduce_mpad_value(self, sch: tvm.tir.Schedule):
+        """
+        Define m pad value will be used in schedule.
+        Read proper hint attribute or provide some heuristic value.
+        """
+        func = sch.mod[sch.func_working_on]
+        if "metaschedule.hint.m_pad_value" in func.attrs.keys():
+            m_pad_value = func.attrs["metaschedule.hint.m_pad_value"]
+            if isinstance(m_pad_value, tvm.tir.IntImm):
+                m_pad_value = m_pad_value.value
+            return m_pad_value
+        
+        return 64  # default value 
 
     def apply(self, sch: tvm.tir.Schedule, block: tvm.tir.schedule.BlockRV):
         if not self.is_acceptable(sch, block):
             return [sch]
 
-        m_pad = 64
-        # Assume order of loops is : B M N K
+        m_pad = self.deduce_mpad_value(sch)
         sch = sch.copy()
 
         # padding prolog
+        # assume order of loops is : B M N K
         sch.pad_einsum(block, padding=[1, m_pad, 16, 16])
         b_pad_a = sch.get_producers(block)[0]
         b_pad_o = sch.get_consumers(block)[0]
@@ -757,7 +770,7 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
             sch.tensorize(blk_16x16, intrin_name)
 
         # vectorize helper
-        def blk_vectorize(blk, vec_size=4):
+        def blk_vectorize(blk, vec_size=4, cooperative=True):
             # 16x16 4*32*Ty
             # Ideally it should be 8 (128bit register containd 8 half floats) 
             ty_size = (lm_factors[-2] * ln_factors[-2])  # TODO: error "Stringifying is not supported for type: tir.Mul"
@@ -767,7 +780,8 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
             # lmn, lmn_ty, lmn_tx, lmn_v = sch.split(lmn, factors=[None, ty_size, tx_size, vec_size])
             lmn, lm_ty, ln_ty_2, lmn_tx, lmn_v = sch.split(lmn, factors=[None, lm_factors[-2], ln_factors[-2], tx_size, vec_size])
             sch.bind(lmn_tx, thread_axis="threadIdx.x")
-            sch.bind(sch.fuse(lm_ty, ln_ty_2), thread_axis="threadIdx.y")
+            if cooperative:
+                sch.bind(sch.fuse(lm_ty, ln_ty_2), thread_axis="threadIdx.y")
             sch.vectorize(lmn_v)
 
             # NB! significant impact. Looks like bank conflict. "buffer_index=0" for cache write, is it correct? 
@@ -783,9 +797,9 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
         blk_tensorize(b_b_wmma, "wmma_load_16x16x16_f16_b_shared_dyn")   # TODO: It accepts "wmma_load_16x16x16_f16_b_trans_shared_dyn" as well.. problem
 
         # vectorize load/store smem
-        blk_vectorize(b_o_shared, vec_size=4)
         blk_vectorize(b_a_shared, vec_size=4)
         blk_vectorize(b_b_shared, vec_size=4)
+        blk_vectorize(b_o_shared, vec_size=4, cooperative=False)
 
         # Padding epilog
         sch.compute_inline(b_pad_a)
@@ -833,8 +847,9 @@ def dtune_load_db(args):
     mem_db = ms.database.MemoryDatabase()
     for wkld in wklds:
         rec = db.get_top_k(wkld, top_k=1)[0]
-        
-        func = wkld.mod["main"].without_attr("metaschedule.hint.dyn_var_value")
+        func = wkld.mod["main"]
+        func = func.without_attr("metaschedule.hint.dyn_var_value")
+        func = func.without_attr("metaschedule.hint.m_pad_value")
         mod = tvm.IRModule({"main": func})
         new_rec = ms.database.TuningRecord(
             trace=rec.trace,

@@ -575,7 +575,8 @@ def dump_mlc_chat_config(
 
 def tune(mod_deploy: tvm.IRModule, args: argparse.Namespace):
     print("Start tuning")
-    m_pad = 64
+    m_values = [512]
+    m_pad_values = [64]  # [64, 96, 128, 160, 192, 224, 256, 288, 320]
     from tvm import meta_schedule as ms
     
     tuning_tasks = ms.relax_integration.extract_tasks(mod_deploy, args.target)    
@@ -589,10 +590,16 @@ def tune(mod_deploy: tvm.IRModule, args: argparse.Namespace):
             return False
         return True
     funcs = {name:f for name, f in funcs.items() if func_filter(f, name)}
-
-    def put_dyn_var_hint(func):
-        return func.with_attr({"metaschedule.hint.dyn_var_value": {"n": m_pad}})
-    funcs = {name:put_dyn_var_hint(f) for name, f in funcs.items() }
+    
+    # put M padding value hint 
+    def put_m_pad_hint(func, m_pad):
+        return func.with_attr({"metaschedule.hint.m_pad_value": m_pad})
+    funcs = {f"{name}_mpad{m_pad}":put_m_pad_hint(f, m_pad) for m_pad in m_pad_values for name, f in funcs.items()}
+    
+    # put M value hint 
+    def put_dyn_var_hint(func, m_val):
+        return func.with_attr({"metaschedule.hint.dyn_var_value": {"n": m_val}})
+    funcs = {f"{name}_mval{m_val}":put_dyn_var_hint(f, m_val) for m_val in m_values for name, f in funcs.items()}
 
     mod_to_tune = tvm.IRModule(funcs)
 
