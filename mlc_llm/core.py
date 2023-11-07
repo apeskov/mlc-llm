@@ -584,7 +584,7 @@ def tune(mod_deploy: tvm.IRModule, args: argparse.Namespace):
     
     # Simple filtering. Keep quantized linear operators only
     def func_filter(func, name):
-        if not ("matmul" in name and "decode" in name):
+        if "matmul" not in name:
             return False
         if "vocab_size" in str(func):
             return False
