@@ -713,9 +713,11 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
         b_pad_a = sch.get_producers(block)[0]
         b_pad_o = sch.get_consumers(block)[0]
 
-        # schedule implement matmul with weight layout [K, N]. Relax use [N, K] by default 
-        if "NT_" in sch.get(block).name_hint:
-            sch.transform_layout(block=block, buffer=("read", 1), index_map=lambda n, k: (k, n), pad_value=None, assume_injective_transform=True)
+        # NB! Do not use transform_layout(block, buffer=("read", 1), ...)
+        #     it may change layout of input argument if block is the first one.
+        #
+        # To respect weights layout
+        is_trans = "NT_" in sch.get(block).name_hint
 
         # block 16x16x16
         lb, lm, ln, lk = sch.get_loops(block)
@@ -788,13 +790,13 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
             sch.storage_align(block=blk, buffer_index=0, axis=-2, factor=16, offset=8)   
         
         # tensorize compute
-        sch.tensorize(b_wmma, "wmma_sync_16x16x16_f16f16f16")
+        sch.tensorize(b_wmma, "wmma_sync_16x16x16_f16f16f16_trans" if is_trans else "wmma_sync_16x16x16_f16f16f16")
         sch.tensorize(b_wmma_init, "wmma_fill_16x16x16_f16")
 
         # tensorize load/store WMMA regs
         blk_tensorize(b_o_wmma, "wmma_store_16x16x16_f16_shared_dyn")
         blk_tensorize(b_a_wmma, "wmma_load_16x16x16_f16_a_shared_dyn")
-        blk_tensorize(b_b_wmma, "wmma_load_16x16x16_f16_b_shared_dyn")   # TODO: It accepts "wmma_load_16x16x16_f16_b_trans_shared_dyn" as well.. problem
+        blk_tensorize(b_b_wmma, "wmma_load_16x16x16_f16_b_trans_shared_dyn" if is_trans else "wmma_load_16x16x16_f16_b_shared_dyn")
 
         # vectorize load/store smem
         blk_vectorize(b_a_shared, vec_size=4)
