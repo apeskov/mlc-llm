@@ -279,24 +279,15 @@ def answer_prompt(args) -> None:
     
     # def instruments(func, func_symbol: str, before_run: bool, ret_value: any, *args):
     #     print(f"{'+' if before_run else '-'} {func_symbol}")
-    #     if func_symbol == "fused_fused_decode2_NT_matmul":
+    #     if func_symbol == "NT_matmul5":
     #         if before_run:
     #             for i, arg in enumerate(args[0:-1]):
     #                 print(f"arg [{i}] {arg.shape} {arg.dtype}")
-    #                 printer(arg)
-
-    #             # fake inferenc
-    #             linear_1(*args)
-    #             ret = args[-1]
-    #             print(ret.numpy()[0,0,:128])
-
     #         else:
     #             ret = args[-1]
     #             print(f"ret [0] {ret.shape} {ret.dtype}")
-    #             printer(ret)
-
+    #
     # vm.set_instrument(instruments)
-
 
     # from torch.profiler import profile, ProfilerActivity
     # with profile(activities=[ProfilerActivity.CUDA], with_modules=False, with_stack=True) as prof:
@@ -315,13 +306,6 @@ def answer_prompt(args) -> None:
         next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True).to(torch.int32)
         tokens[:, cur_len] = next_token
         next_token = tvm.nd.from_dlpack(next_token)
-
-        # if next_token.__str__() == "[[29953]]":
-        #     print("CORRECT")
-        # else:
-        #     print("Incorrect ((((")
-        
-        # print("[NEXT TOKEN] ", next_token)
 
         for _ in range(seq_len):
             cur_len += 1
