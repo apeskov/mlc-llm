@@ -836,7 +836,7 @@ def dtune_space_gen():
     return ms.space_generator.PostOrderApply(sch_rules=rules, postprocs=postprocs, mutator_probs=ms_rule_kind)
 
 
-def dtune_load_db(args):
+def dtune_load_db(args, filter=None):
     if args.tune_db_path == "no":
         return ms.database.MemoryDatabase()
 
@@ -858,6 +858,10 @@ def dtune_load_db(args):
     for wkld in wklds:
         rec = db.get_top_k(wkld, top_k=1)[0]
         func = wkld.mod["main"]
+
+        if filter is not None and not filter(func.attrs):
+            continue
+
         func = func.without_attr("metaschedule.hint.dyn_var_value")
         func = func.without_attr("metaschedule.hint.m_pad_value")
         mod = tvm.IRModule({"main": func})
