@@ -10,7 +10,7 @@ from tvm.script import tir as T
 import tvm.tir.tensor_intrin.cuda
 from mlc_llm.utils import dtune_space_gen
 
-TARGET = tvm.target.Target("nvidia/nvidia-a10g")
+TARGET = tvm.target.Target("nvidia/nvidia-a100")
 DEV = tvm.cuda(0)
 
 
@@ -45,13 +45,13 @@ def main():
         func = func.with_attr({"metaschedule.hint.dyn_var_value": {"n": mval}})
         return f"linear1_mpad{mpad}_mvar{mval}", func
 
-    tasks = [make_func(i, i) for i in [16,48,64]]   # [16,32,48,64,128]
+    tasks = [make_func(i, i) for i in [192, 256]]   # [16,32,48,64,128]
     tasks = {name: func for name, func in tasks}
 
     ms.tir_integration.tune_tir(
         mod=tvm.IRModule(tasks),
         target=TARGET,
-        work_dir="__tmp/tune_roofline_2_16_48_64",
+        work_dir="__tmp/tune_roofline_192_256",
         max_trials_global=100500,
         # max_trials_per_task=4096,
         max_trials_per_task=256,

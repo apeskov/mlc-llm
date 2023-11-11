@@ -16,8 +16,11 @@ import tvm.tir.tensor_intrin.cuda
 from mlc_llm.transform import FuseDecodeMatmulEwise
 from mlc_llm.utils import dtune_load_db
 
+from collections import namedtuple
+from typing import List
 
-TARGET = tvm.target.Target("nvidia/nvidia-a10g")
+
+TARGET = tvm.target.Target("nvidia/nvidia-a100")
 DEV = tvm.cuda(0)
 
 
@@ -135,47 +138,6 @@ def linear1_q4_static_arg_info_provider(n):
 
 
 @I.ir_module
-class linear1_q4_static_2_mod:
-    @T.prim_func(private=True)
-    def fused_fused_decode4_NT_matmul2(lv16: T.Buffer((T.int64(22016), T.int64(512)), "uint32"), lv17: T.Buffer((T.int64(22016), T.int64(128)), "float16"), lv1: T.Buffer((T.int64(1), T.int64(2), T.int64(4096)), "float16"), var_NT_matmul_intermediate: T.Buffer((T.int64(1), T.int64(2), T.int64(22016)), "float16")):
-        T.func_attr({"tir.noalias": T.bool(True)})
-        # with T.block("root"):
-        p_output0_intermediate = T.alloc_buffer((T.int64(22016), T.int64(4096)), "float16")
-        for i, j in T.grid(T.int64(22016), T.int64(4096)):
-            with T.block("decode"):
-                v_i, v_j = T.axis.remap("SS", [i, j])
-                T.reads(lv16[v_i, v_j // T.int64(8)], lv17[v_i, v_j // T.int64(32)])
-                T.writes(p_output0_intermediate[v_i, v_j])
-                p_output0_intermediate[v_i, v_j] = (T.Cast("float16", T.bitwise_and(T.shift_right(lv16[v_i, v_j // T.int64(8)], T.Cast("uint32", v_j % T.int64(8)) * T.uint32(4)), T.uint32(15))) - T.float16(7)) * lv17[v_i, v_j // T.int64(32)]
-        for i0, i1, i2, k in T.grid(T.int64(1), T.int64(2), T.int64(22016), T.int64(4096)):
-            with T.block("NT_matmul"):
-                v_i0, v_i1, v_i2, v_k = T.axis.remap("SSSR", [i0, i1, i2, k])
-                T.reads(lv1[v_i0, v_i1, v_k], p_output0_intermediate[v_i2, v_k])
-                T.writes(var_NT_matmul_intermediate[v_i0, v_i1, v_i2])
-                with T.init():
-                    var_NT_matmul_intermediate[v_i0, v_i1, v_i2] = T.float16(0)
-                var_NT_matmul_intermediate[v_i0, v_i1, v_i2] = var_NT_matmul_intermediate[v_i0, v_i1, v_i2] + lv1[v_i0, v_i1, v_k] * p_output0_intermediate[v_i2, v_k]
-
-    @R.function
-    def main(A: R.Tensor((1, 2, 4096), dtype="float16"),
-             B: R.Tensor((T.int64(22016), T.int64(512)), "uint32"),
-             B_SCL: R.Tensor((T.int64(22016), T.int64(128)), "float16")):
-        cls = linear1_q4_static_2_mod
-        with R.dataflow():
-            x = R.call_tir(cls.fused_fused_decode4_NT_matmul2, (B, B_SCL, A), out_sinfo=R.Tensor((1, 2, 22016), dtype="float16"))
-            R.output(x)
-        return x
-
-
-def linear1_q4_static_2_arg_info_provider(n):
-    return [
-        ms.arg_info.TensorInfo("float16", [1, 2, 4096]),
-        ms.arg_info.TensorInfo("uint32", [22016, 512]),
-        ms.arg_info.TensorInfo("float16", [22016, 128]),
-    ]
-
-
-@I.ir_module
 class linear1_mod:
     @R.function
     def main(A: R.Tensor((1, "n", 4096), dtype="float16"), 
@@ -220,63 +182,91 @@ def compile_relax(mod, with_dlight=False, with_cublas=False, with_cutlass=False,
     return ex
 
 
-def benchmark(ex, arg_info_provider):
-    vm = relax.VirtualMachine(ex, DEV)
-    
-    print(f"NB TIME_US")
-    for m in range(1, 512):
-        args_info = arg_info_provider(m)
-        args = [make_arg(info) for info in args_info]
+BenchmarkConfig = namedtuple("BenchmarkConfig", ["range", "step"])
+Workload = namedtuple("Workload", ["name", "ex", "arg_info_provider"])
 
-        score = vm.time_evaluator("main", dev=DEV, number=100, repeat=1, min_repeat_ms=100)(*args).mean
-        score_us = int(float(score)*1e6)
-        print(f"{m} {score_us}")
+def benchmark(workloads: List[Workload], cfg: BenchmarkConfig = BenchmarkConfig(4096, 8)):
+    for wkl in workloads:
+        vm = relax.VirtualMachine(wkl.ex, DEV)
+
+        print("-"*20)    
+        print(f"Impl {wkl.name}")    
+
+        for m in range(cfg.step, cfg.range + 1, cfg.step):
+            args_info = wkl.arg_info_provider(m)
+            args = [make_arg(info) for info in args_info]
+
+            score = vm.time_evaluator("main", dev=DEV, number=100, repeat=1, min_repeat_ms=100)(*args).mean
+            score_us = int(float(score)*1e6)
+            print(f"{m} {score_us}")
 
 
 def main():
-    mod = linear1_mod
-    arg_info_provider = linear1_arg_info_provider
-
-    # ex = compile_relax(mod, with_cublas=True)
-    # benchmark(ex, arg_info_provider)
-
-    # ex = compile_relax(mod, with_dlight=True)
-    # benchmark(ex, arg_info_provider)
-
-    mod = linear1_ft_mod
-    arg_info_provider = linear1_ft_arg_info_provider
-
-    # ex = compile_relax(mod, with_cutlass=True)
-    # benchmark(ex, arg_info_provider)
-
-    # ex = compile_relax(mod, with_dlight=True)
-    # benchmark(ex, arg_info_provider)
-
-    mod = linear1_q4_mod
-    arg_info_provider = linear1_q4_arg_info_provider
-
-    # ex = compile_relax(mod, with_dlight=True)
-    # benchmark(ex, arg_info_provider)
-
-    # args = lambda: None
-    # args.tune_db_path = "__tmp/tune_roofline_2_16_48_64"
-    # mpad = 64
-    # def filter(attrs):
-    #     return attrs["metaschedule.hint.dyn_var_value"]["n"] == mpad and attrs["metaschedule.hint.m_pad_value"] == mpad
+    workloads: List[Workload] = []
     
-    # db = dtune_load_db(args, filter=filter)
-    # ex = compile_relax(mod, db=db)
-    # benchmark(ex, arg_info_provider)
+    # ======== FP16 ========
+    # cuBLASS
+    workloads.append(Workload(
+        "cublas_f16", 
+        compile_relax(linear1_mod, with_cublas=True), 
+        linear1_arg_info_provider
+    ))
+    
+    # DLight fp16
+    workloads.append(Workload(
+        "dlight_f16", 
+        compile_relax(linear1_mod, with_dlight=True), 
+        linear1_arg_info_provider
+    ))
 
-    # mod = linear1_q4_static_mod
-    # arg_info_provider = linear1_q4_static_arg_info_provider
-    # ex = compile_relax(mod, with_dlight=True)
-    # benchmark(ex, arg_info_provider)
+    # ======== Q4 ========
+    # cutlass
+    workloads.append(Workload(
+        "cutlass_q4_ft", 
+        compile_relax(linear1_ft_mod, with_cutlass=True), 
+        linear1_ft_arg_info_provider
+    ))
 
-    # mod = linear1_q4_static_2_mod
-    # arg_info_provider = linear1_q4_static_2_arg_info_provider
-    # ex = compile_relax(mod, with_dlight=True)
-    # benchmark(ex, arg_info_provider)
+    # DLight Q4 FT
+    workloads.append(Workload(
+        "dlight_q4_ft", 
+        compile_relax(linear1_ft_mod, with_dlight=True), 
+        linear1_ft_arg_info_provider
+    ))
+
+    # DLight Q4 0
+    workloads.append(Workload(
+        "dlight_q4_0", 
+        compile_relax(linear1_q4_mod, with_dlight=True), 
+        linear1_q4_arg_info_provider
+    ))
+
+    # DTune Q4 0
+    args = lambda: None
+    args.tune_db_path = "__tmp/tune_roofline_16_32_64_128"
+    mpad = 64
+    def filter(attrs):
+        return attrs["metaschedule.hint.dyn_var_value"]["n"] == mpad and attrs["metaschedule.hint.m_pad_value"] == mpad
+    
+    db = dtune_load_db(args, filter=filter)
+
+    workloads.append(Workload(
+        f"dtune_q4_{mpad}", 
+        compile_relax(linear1_q4_mod, db=db), 
+        linear1_q4_arg_info_provider
+    ))
+
+    # ======== Q4 STATIC ========
+    # DLight Q4 STATIC M=1 
+    workloads.append(Workload(
+        "dlight_q4_static_m1", 
+        compile_relax(linear1_q4_static_mod, with_dlight=True), 
+        linear1_q4_static_arg_info_provider
+    ))
+
+    workloads = [w for w in workloads if w.name in ["dlight_q4_0"]]  # [f"dtune_q4_{mpad}"]]  # ["dtune_q4_256", "cutlass_q4_ft", "dlight_q4_ft", "dlight_q4_0"]]
+    benchmark(workloads)
+
 
 
 if __name__ == "__main__":

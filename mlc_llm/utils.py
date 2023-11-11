@@ -759,12 +759,12 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
         
         b_a_shared = sch.cache_read(b_wmma, read_buffer_index=0, storage_scope="shared.dyn")
         b_a_wmma = sch.cache_read(b_wmma, read_buffer_index=0, storage_scope="wmma.matrix_a")
-        sch.compute_at(b_a_wmma, loop=lk_1, preserve_unit_loops=True, index=-1)      # NB! Not lk_b2, to reduce wmma::fragments count
+        sch.compute_at(b_a_wmma, loop=lk_1, preserve_unit_loops=True, index=-1)
         sch.compute_at(b_a_shared, loop=lk_2, preserve_unit_loops=True, index=-1)
 
         b_b_shared = sch.cache_read(b_wmma, read_buffer_index=1, storage_scope="shared.dyn")
         b_b_wmma = sch.cache_read(b_wmma, read_buffer_index=1, storage_scope="wmma.matrix_b")
-        sch.compute_at(b_b_wmma, loop=lk_1, preserve_unit_loops=True, index=-1)      # NB! Not lk_b2, to reduce wmma::fragments count
+        sch.compute_at(b_b_wmma, loop=lk_1, preserve_unit_loops=True, index=-1)
         sch.compute_at(b_b_shared, loop=lk_2, preserve_unit_loops=True, index=-1)
 
         b_wmma_init = sch.decompose_reduction(block=b_wmma, loop=lk_2)
