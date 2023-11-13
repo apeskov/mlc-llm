@@ -133,6 +133,9 @@ prompt_templates = {
               "The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
               "USER\n {prompt}\n"
               "ASSISTANT\n",
+    "Llama2": "[INST] <<SYS>>\n\nYou are a helpful, respectful and honest assistant.\n<</SYS>>\n\n "
+              "[INST]\n {prompt}\n"
+              "[/INST]\n",
 }
 
 
@@ -353,7 +356,7 @@ def benchmark_prefill(args):
 
     tokens = generate_input_seq(prompt_templates[mod_name], tokenizer, seq_len)
 
-    for seq_len in range(8, 2049, 8):
+    for seq_len in range(8, 4097, 8):
         kv_caches = vm["create_kv_cache"]()
         
         tokens = generate_input_seq(prompt_templates[mod_name], tokenizer, seq_len)
