@@ -680,8 +680,9 @@ def parse_target(args: argparse.Namespace) -> None:
 
 @ms.utils.derived_object
 class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
-    def __init__(self) -> None:
+    def __init__(self, decisions = {}) -> None:
         super().__init__()
+        self._decisions = decisions
 
     def _initialize_with_tune_context(self, context) -> None:
         pass
@@ -705,6 +706,9 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
             if isinstance(m_pad_value, tvm.tir.IntImm):
                 m_pad_value = m_pad_value.value
             return m_pad_value
+
+        if "m_pad" in self._decisions:
+            return self._decisions["m_pad"]
         
         return 64  # default value 
 
@@ -735,12 +739,16 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
         sch.reorder(lm, ln, lk, lm_b, ln_b, lk_b)
         b_wmma = sch.blockize(lm_b)
 
+        m_decisions = self._decisions["m_factors"] if "m_factors" in self._decisions else None
+        n_decisions = self._decisions["n_factors"] if "n_factors" in self._decisions else None
+        k_decisions = self._decisions["k_factors"] if "k_factors" in self._decisions else None
+
         lm_4, lm = sch.split(lm, factors=[None, m_pad//16])
-        lm_factors = sch.sample_perfect_tile(loop=lm, n=3, max_innermost_factor=4)
+        lm_factors = sch.sample_perfect_tile(loop=lm, n=3, max_innermost_factor=4, decision=m_decisions)
         lm_3, lm_2, lm_1 = sch.split(lm, factors=lm_factors)
-        ln_factors = sch.sample_perfect_tile(loop=ln, n=4, max_innermost_factor=4)
+        ln_factors = sch.sample_perfect_tile(loop=ln, n=4, max_innermost_factor=4, decision=n_decisions)
         ln_4, ln_3, ln_2, ln_1 = sch.split(ln, factors=ln_factors)
-        lk_factors = sch.sample_perfect_tile(loop=lk, n=2, max_innermost_factor=4)
+        lk_factors = sch.sample_perfect_tile(loop=lk, n=2, max_innermost_factor=4, decision=k_decisions)
         lk_2, lk_1 = sch.split(lk, factors=lk_factors)
         sch.reorder(lm_4, ln_4, lm_3, ln_3, lm_2, ln_2, lk_2, lk_1, lm_1, ln_1)
         lnm_by = sch.fuse(lm_4, ln_4)
