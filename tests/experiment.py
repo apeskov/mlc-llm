@@ -111,7 +111,7 @@ def main():
     sch = mds_rule.apply(sch, sch.get_block("matmul"))[0]
     sch.compute_inline(sch.get_block("decode"))
 
-    with TARGET:
+    with TARGET, tvm.transform.PassContext(opt_level=3, config={"relax.backend.use_cuda_graph": True, "cuda.kernels_output_dir": "my_cuda_kernels"}):
         lib = tvm.build(sch.mod)
 
     cuda_dump(lib)
@@ -119,7 +119,7 @@ def main():
     args_info = ms.arg_info.ArgInfo.from_prim_func(func, sym_var_hint={"n": M})
     args = [make_arg(info) for info in args_info]
 
-    score_us = int(lib.time_evaluator(lib.entry_name, DEV)(*args).mean * 1e6)
+    score_us = int(lib.time_evaluator(lib.entry_name, DEV, number=100, repeat=1, min_repeat_ms=100)(*args).mean * 1e6)
     print("[EXE TIME US] : ", score_us)
     print("[THRP TMACPS] : ", M*N*K / score_us / 1e6)
 
