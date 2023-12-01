@@ -823,6 +823,10 @@ class MDS1ScheduleRule(ms.schedule_rule.PyScheduleRule):
         sch.compute_inline(b_pad_a)
         sch.reverse_compute_inline(b_pad_o)
 
+        # TBR
+        # sch.reverse_compute_at(sch.get_block("var_matmul_intermediate_pad_shared.dyn"), sch.get_loops("var_matmul_intermediate_pad_shared.dyn_wmma.accumulator_o")[5])
+        # TBR
+
         return [sch]
 
 
